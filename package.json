@@ -1,0 +1,9 @@
+{
+  "name": "refood-training",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Scheda ipertrofia 4 giorni collegata a Google Sheets",
+  "dependencies": {
+    "googleapis": "^144.0.0"
+  }
+}

@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0E1116">
+<title>Refood Training</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="mark"></span>
+    <span>Refood Training</span>
+  </div>
+  <div class="clock" id="globalTimer">00:00:00</div>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button data-view="allenamento" class="on">Allenamento</button>
+  <button data-view="debolezze">Debolezze</button>
+  <button data-view="riadatta">Riadatta</button>
+  <button data-view="storico">Storico</button>
+  <button data-view="analisi">Analisi</button>
+</nav>
+
+<main id="main">
+  <div class="loading" id="boot">
+    <div class="bar"><i></i></div>
+    <p>Carico la scheda dal foglio…</p>
+  </div>
+</main>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
