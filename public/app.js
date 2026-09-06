@@ -20,14 +20,20 @@ let S = {
 };
 
 /* ---------------- persistenza ---------------- */
-const save = () => localStorage.setItem(LS, JSON.stringify(S));
+const save = () => {
+  S.savedAt = Date.now();
+  localStorage.setItem(LS, JSON.stringify(S));
+};
 function load() {
   try {
     const raw = localStorage.getItem(LS);
     if (!raw) return;
     const p = JSON.parse(raw);
-    // scarta una sessione lasciata aperta da più di 12 ore
-    if (p.tStart && Date.now() / 1000 - p.tStart > 43200) return localStorage.removeItem(LS);
+    // Si scarta solo se l'ultimo tocco risale a più di 16 ore fa.
+    // Prima si guardava il cronometro: una seduta in pausa veniva buttata via
+    // anche se l'avevi appena lasciata.
+    const eta = p.savedAt ? Date.now() - p.savedAt : 0;
+    if (eta > 16 * 3600 * 1000) return localStorage.removeItem(LS);
     S = { ...S, ...p };
   } catch (e) { localStorage.removeItem(LS); }
 }
@@ -550,14 +556,19 @@ function bind() {
   document.querySelectorAll("[data-set]").forEach((b) => b.onclick = () => {
     const k = b.dataset.set; S.sets[k] = !S.sets[k]; save(); render();
   });
-  document.querySelectorAll("[data-rep]").forEach((i) => i.onchange = () => {
+  // oninput e non onchange: onchange scatta solo quando esci dal campo, quindi
+  // chiudendo il browser col cursore ancora dentro il numero si perdeva.
+  document.querySelectorAll("[data-rep]").forEach((i) => i.oninput = () => {
     const v = parseInt(i.value);
     if (isNaN(v) || v <= 0) delete S.reps[i.dataset.rep];
     else S.reps[i.dataset.rep] = v;
     save();
   });
-  document.querySelectorAll("[data-kg]").forEach((i) => i.onchange = () => {
-    S.kg[i.dataset.kg] = num(i.value); save(); render();
+  // Il peso si memorizza a ogni cifra, ma si ridisegna solo quando esci dal campo:
+  // ridisegnare a ogni tasto farebbe perdere il cursore.
+  document.querySelectorAll("[data-kg]").forEach((i) => {
+    i.oninput = () => { S.kg[i.dataset.kg] = num(i.value); save(); };
+    i.onchange = () => { S.kg[i.dataset.kg] = num(i.value); save(); render(); };
   });
   document.querySelectorAll("[data-rest]").forEach((b) => b.onclick = () => {
     const id = b.dataset.rest;
@@ -728,6 +739,71 @@ async function saveDeload() {
   } catch (e) { toast(e.message, true); btn.disabled = false; btn.textContent = "Registra scarico"; }
 }
 
+
+/* ---------------- tastierino di accesso ----------------
+   Tiene fuori chi capita sull'indirizzo per caso. Non e una protezione forte:
+   il codice sta nel browser e chi guarda il sorgente lo trova. Per un diario
+   di allenamento va bene cosi. */
+
+const PIN = "134679";
+const PIN_OK = "refood.pin.ok";
+
+function lock(then) {
+  if (localStorage.getItem(PIN_OK) === PIN) return then();
+
+  const el = document.createElement("div");
+  el.className = "lock";
+  el.innerHTML = `
+    <div class="lockbox">
+      <div class="lockmark"></div>
+      <h1>Refood Training</h1>
+      <p id="lockMsg">Inserisci il codice</p>
+      <div class="dots" id="dots">${"<i></i>".repeat(6)}</div>
+      <div class="pad">
+        ${[1,2,3,4,5,6,7,8,9].map(n=>`<button data-n="${n}">${n}</button>`).join("")}
+        <button data-act="del">&#9003;</button>
+        <button data-n="0">0</button>
+        <button data-act="clr">C</button>
+      </div>
+    </div>`;
+  document.body.appendChild(el);
+
+  let buf = "";
+  const dots = () => el.querySelectorAll("#dots i")
+    .forEach((d, i) => d.classList.toggle("on", i < buf.length));
+
+  function press(n) {
+    if (buf.length >= 6) return;
+    buf += n; dots();
+    if (buf.length === 6) setTimeout(check, 120);
+  }
+  function check() {
+    if (buf === PIN) {
+      localStorage.setItem(PIN_OK, PIN);
+      el.classList.add("open");
+      setTimeout(() => { el.remove(); then(); }, 240);
+    } else {
+      const box = el.querySelector(".lockbox");
+      box.classList.add("no");
+      el.querySelector("#lockMsg").textContent = "Codice errato";
+      if (navigator.vibrate) navigator.vibrate([90, 60, 90]);
+      setTimeout(() => { box.classList.remove("no"); buf = ""; dots(); }, 420);
+    }
+  }
+
+  el.querySelectorAll("[data-n]").forEach((b) =>
+    b.onclick = () => press(b.dataset.n));
+  el.querySelector('[data-act="del"]').onclick = () => { buf = buf.slice(0, -1); dots(); };
+  el.querySelector('[data-act="clr"]').onclick = () => { buf = ""; dots(); };
+
+  // funziona anche da tastiera fisica
+  document.addEventListener("keydown", function onKey(e) {
+    if (!document.body.contains(el)) return document.removeEventListener("keydown", onKey);
+    if (/^[0-9]$/.test(e.key)) press(e.key);
+    else if (e.key === "Backspace") { buf = buf.slice(0, -1); dots(); }
+  });
+}
+
 /* ---------------- avvio ---------------- */
 async function boot() {
   try {
@@ -742,8 +818,13 @@ async function boot() {
   }
 }
 
+// Rete di sicurezza: il telefono puo chiudere la pagina senza preavviso.
+// Salviamo anche quando l'app va in secondo piano o la scheda si chiude.
+document.addEventListener("visibilitychange", () => { if (document.hidden) save(); });
+window.addEventListener("pagehide", save);
+
 document.querySelectorAll("#tabs button").forEach((b) =>
   b.onclick = () => { S.view = b.dataset.view; save(); render(); });
 
 load();
-boot();
+lock(boot);
