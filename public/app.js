@@ -1,5 +1,6 @@
 /* Refood Training — client
-   Stato salvato in localStorage: chiudere il browser non perde nulla. */
+   Stato salvato in localStorage: chiudere il browser non perde nulla.
+   Modalità nativa: 1 Top Set + Back-off con calcolo automatico (step minimo 2.5 kg). */
 
 // Funziona sia su Vercel (/api/sheets) sia su Netlify (/.netlify/functions/sheets).
 const API = location.hostname.includes("netlify")
@@ -12,8 +13,12 @@ let S = {
   day: null,
   view: "allenamento",
   sets: {},      // "A-01:1" -> true
-  reps: {},      // "A-01:1" -> 8
-  kg: {},        // "A-01"   -> 13.75
+  reps: {},      // "A-01:1" -> 7
+  kg: {},        // "A-01"   -> 22.5 (Top Set o carico fisso)
+  boKg: {},      // "A-01"   -> override manuale kg back-off (opzionale)
+  mode: {},      // "A-01"   -> "flat" se l'utente passa a carico fisso
+  boPct: 12.5,   // riduzione carico back-off di default (-12.5%)
+  boStep: 2.5,   // peso minimo disponibile (2.5 kg)
   rpe: 7, sonno: "Buono", stress: "Medio", note: "",
   tStart: 0, tAcc: 0, tRun: false,
   rest: {},      // "A-01"   -> timestamp fine
@@ -29,12 +34,16 @@ function load() {
     const raw = localStorage.getItem(LS);
     if (!raw) return;
     const p = JSON.parse(raw);
-    // Si scarta solo se l'ultimo tocco risale a più di 16 ore fa.
-    // Prima si guardava il cronometro: una seduta in pausa veniva buttata via
-    // anche se l'avevi appena lasciata.
     const eta = p.savedAt ? Date.now() - p.savedAt : 0;
     if (eta > 16 * 3600 * 1000) return localStorage.removeItem(LS);
-    S = { ...S, ...p };
+    S = {
+      ...S,
+      ...p,
+      boKg: p.boKg || {},
+      mode: p.mode || {},
+      boPct: typeof p.boPct === "number" ? p.boPct : 12.5,
+      boStep: typeof p.boStep === "number" ? p.boStep : 2.5,
+    };
   } catch (e) { localStorage.removeItem(LS); }
 }
 
@@ -43,7 +52,12 @@ const $ = (s, r = document) => r.querySelector(s);
 const esc = (t) => String(t ?? "").replace(/[&<>"]/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const num = (v) => { const n = parseFloat(String(v).replace(",", ".")); return isNaN(n) ? 0 : n; };
+const fmtKg = (v) => {
+  const n = Math.round(num(v) * 100) / 100;
+  return String(n);
+};
 const nSerie = (e) => Math.max(1, parseInt(String(e["Serie target"]).split("-").pop()) || 4);
+const isTopBo = (e) => nSerie(e) >= 2 && S.mode[e.ID] !== "flat";
 
 // "5-7" -> 7 ; "12" -> 12 ; "max" -> null
 function topReps(e) {
@@ -56,6 +70,42 @@ function botReps(e) {
   const nums = String(e["Ripetizioni target"] || "").match(/\d+/g);
   return nums ? Math.min(...nums.map(Number)) : 8;
 }
+// Range consigliato per le serie di back-off in base al range del Top Set
+function boRange(e) {
+  const t = String(e["Ripetizioni target"] || "").trim();
+  if (/max/i.test(t)) return t;
+  const b = botReps(e), tp = topReps(e) || b;
+  if (tp <= 8) return "8-10";
+  if (tp <= 10) return "10-12";
+  if (tp <= 12) return "12-15";
+  return t;
+}
+function boBotReps(e) {
+  const nums = String(boRange(e)).match(/\d+/g);
+  return nums ? Math.min(...nums.map(Number)) : botReps(e);
+}
+
+// Calcolo automatico del carico di back-off arrotondato allo step minimo (2.5 kg).
+// Garantisce sempre almeno uno step sotto il Top Set quando topKg > step,
+// e non scende mai sotto step (o 0 se esercizio a corpo libero).
+function calcBackoff(topKg, pctVal = S.boPct, step = S.boStep) {
+  const kg = num(topKg);
+  if (kg <= 0) return 0;
+  if (kg <= step) return Math.round(kg * 100) / 100;
+  const raw = kg * (1 - pctVal / 100);
+  let rounded = Math.round(raw / step) * step;
+  if (rounded >= kg) {
+    rounded = Math.floor((kg - 1e-9) / step) * step;
+  }
+  return Math.max(step, Math.round(rounded * 100) / 100);
+}
+function currentBoKg(id, topKg) {
+  if (S.boKg[id] !== undefined && S.boKg[id] !== null && S.boKg[id] !== "") {
+    return num(S.boKg[id]);
+  }
+  return calcBackoff(topKg, S.boPct, S.boStep);
+}
+
 function secs(t) {
   t = String(t || "").trim();
   const m = t.match(/(\d+)\s*'/), s = t.match(/'\s*(\d+)/);
@@ -64,7 +114,69 @@ function secs(t) {
 }
 const hhmmss = (t) => [Math.floor(t / 3600), Math.floor(t % 3600 / 60), t % 60]
   .map((x) => String(x).padStart(2, "0")).join(":");
-const repsSum = (r) => String(r || "").split("-").reduce((a, x) => a + (parseInt(x) || 0), 0);
+
+// Epley: stima del massimale da una serie. Serie sotto le 12 reps, oltre perde precisione.
+const e1rm = (kg, reps) => (reps > 0 && reps <= 12) ? kg * (1 + reps / 30) : kg;
+
+// Parser universale per Log_v2: legge sia il vecchio formato ("8-8-8-7")
+// sia il nuovo formato Top Set + Back-off ("7 | 9-9-8 @20").
+function parseLogEntry(kgVal, repsStr) {
+  const topKg = num(kgVal);
+  const raw = String(repsStr || "").trim();
+
+  if (raw.includes("|")) {
+    const [tsPart = "", boPart = ""] = raw.split("|").map((s) => s.trim());
+    const tsMatch = tsPart.match(/\d+/);
+    const tsRep = tsMatch ? parseInt(tsMatch[0], 10) : null;
+
+    const kgMatch = boPart.match(/@\s*([\d.,]+)/);
+    const boKg = kgMatch ? num(kgMatch[1]) : calcBackoff(topKg, 12.5, 2.5);
+
+    const boClean = boPart.replace(/@.*$/, "").replace(/BO\s*\([^)]*\)\s*:?/i, "").replace(/BO:?/i, "").trim();
+    const boReps = boClean
+      ? boClean.split("-").map((x) => parseInt(x, 10)).filter((x) => !isNaN(x))
+      : [];
+
+    const allReps = [...(tsRep !== null ? [tsRep] : []), ...boReps];
+    const volume =
+      (tsRep !== null ? topKg * tsRep : 0) +
+      boReps.reduce((a, r) => a + boKg * r, 0);
+    const e1rms = [
+      ...(tsRep !== null ? [e1rm(topKg, tsRep)] : []),
+      ...boReps.map((r) => e1rm(boKg, r)),
+    ];
+
+    return {
+      isTopBo: true,
+      raw,
+      topKg,
+      tsRep,
+      boKg,
+      boReps,
+      reps: allReps,
+      tot: allReps.reduce((a, b) => a + b, 0),
+      serie: allReps.length,
+      volume,
+      best: Math.max(...e1rms, 0),
+    };
+  }
+
+  const reps = raw.split("-").map((x) => parseInt(x, 10)).filter((x) => !isNaN(x));
+  const tot = reps.reduce((a, b) => a + b, 0);
+  return {
+    isTopBo: false,
+    raw,
+    topKg,
+    tsRep: reps[0] ?? null,
+    boKg: null,
+    boReps: reps.slice(1),
+    reps,
+    tot,
+    serie: reps.length,
+    volume: topKg * tot,
+    best: Math.max(...reps.map((r) => e1rm(topKg, r)), 0),
+  };
+}
 
 function toast(msg, err) {
   const t = $("#toast");
@@ -77,7 +189,8 @@ function lastPerf(id) {
   const rows = DB.log.filter((r) => r.Esercizio === id);
   if (!rows.length) return null;
   const r = rows[rows.length - 1];
-  return { kg: num(r.KG), reps: r["Reps fatte"], data: r.Data };
+  const parsed = parseLogEntry(r.KG, r["Reps fatte"]);
+  return { kg: parsed.topKg, reps: r["Reps fatte"], data: r.Data, parsed };
 }
 function lastReadapt(id) {
   const rows = DB.eventi.filter((e) =>
@@ -88,28 +201,54 @@ function lastReadapt(id) {
 // il riferimento per la prossima seduta: riadattamento se più recente dell'ultimo log
 function baseline(id) {
   const p = lastPerf(id), r = lastReadapt(id);
-  if (r && (!p || String(r.Data_inizio).slice(0, 10) >= String(p.data).slice(0, 10)))
-    return { kg: num(r.KG), reps: r.Reps, data: String(r.Data_inizio).slice(0, 10), reset: true, note: r.Note };
+  if (r && (!p || String(r.Data_inizio).slice(0, 10) >= String(p.data).slice(0, 10))) {
+    const parsed = parseLogEntry(r.KG, r.Reps);
+    return {
+      kg: num(r.KG),
+      reps: r.Reps,
+      data: String(r.Data_inizio).slice(0, 10),
+      reset: true,
+      note: r.Note,
+      parsed,
+    };
+  }
   return p ? { ...p, reset: false } : null;
 }
+
 // Ripetizioni della serie i (0-based): quello che vedi è quello che viene salvato.
-// Se non hai toccato il campo, vale il valore mostrato — mai zero.
 function repsFor(ex, i, base) {
   const k = `${ex.ID}:${i + 1}`;
   if (S.reps[k] !== undefined && S.reps[k] !== null && S.reps[k] !== "") return S.reps[k];
-  const prev = base
-    ? String(base.reps).split("-").map((x) => parseInt(x)).filter((x) => !isNaN(x))
-    : [];
+
+  const p = base && base.parsed ? base.parsed : null;
+  if (isTopBo(ex)) {
+    if (i === 0) {
+      if (p && p.tsRep !== null) return p.tsRep;
+      return botReps(ex);
+    }
+    // Serie di back-off (i >= 1)
+    if (p && p.isTopBo && p.boReps.length) {
+      return p.boReps[i - 1] ?? p.boReps[p.boReps.length - 1] ?? boBotReps(ex);
+    }
+    return boBotReps(ex);
+  }
+
+  const prev = p ? p.reps : [];
   return prev[i] ?? prev[prev.length - 1] ?? botReps(ex);
 }
 
-// regola nuova: si sale solo con TUTTE le serie al massimo del range
+// Regola di progressione:
+// - Se l'ultima seduta era Top+BO (o siamo in Top+BO): sali appena il Top Set chiude il massimo del range!
+// - Se era carico fisso: sali quando TUTTE le serie chiudono al massimo del range.
 function shouldIncrease(ex, base) {
-  if (!base || base.reset) return false;
+  if (!base || base.reset || !base.parsed) return false;
   const top = topReps(ex); if (!top) return false;
-  const parts = String(base.reps).split("-").map((x) => parseInt(x)).filter((x) => !isNaN(x));
-  if (parts.length < nSerie(ex)) return false;
-  return parts.every((r) => r >= top);
+  const p = base.parsed;
+  if (p.isTopBo) {
+    return p.tsRep !== null && p.tsRep >= top;
+  }
+  if (p.reps.length < nSerie(ex)) return false;
+  return p.reps.every((r) => r >= top);
 }
 
 /* ---------------- render: allenamento ---------------- */
@@ -127,6 +266,9 @@ function viewAllenamento() {
   }).join("");
 
   const title = S.day.replace(/^[A-D]\s*-\s*/, "");
+  const pctOpts = [10, 12.5, 15].map((p) =>
+    `<button data-bopct="${p}" class="${S.boPct === p ? "on" : ""}">−${p}%</button>`
+  ).join("");
 
   return `
   <div class="days">${days}</div>
@@ -135,6 +277,10 @@ function viewAllenamento() {
   <div class="timerbar">
     <button id="tToggle" class="${S.tRun ? "" : "go"}">${S.tRun ? "Metti in pausa" : "Avvia allenamento"}</button>
     <button id="tReset">Azzera</button>
+  </div>
+  <div class="bobar">
+    <span class="bolbl">Back-off auto <small>(step ${fmtKg(S.boStep)} kg)</small></span>
+    <div class="bopills">${pctOpts}</div>
   </div>
   ${list.map(exCard).join("")}
   <div class="card">
@@ -156,38 +302,94 @@ function viewAllenamento() {
 
 function exCard(ex) {
   const id = ex.ID, n = nSerie(ex), base = baseline(id);
+  const tsMode = isTopBo(ex);
   const up = shouldIncrease(ex, base);
   const def = base ? base.kg : 0;
   const kg = S.kg[id] !== undefined ? S.kg[id] : def;
   const changed = Math.abs(num(kg) - num(def)) > 1e-9;
 
+  const boAuto = calcBackoff(kg, S.boPct, S.boStep);
+  const boVal = currentBoKg(id, kg);
+  const boManual = S.boKg[id] !== undefined && Math.abs(num(S.boKg[id]) - boAuto) > 1e-9;
+
   let done = 0;
   const sets = Array.from({ length: n }, (_, i) => {
     const k = `${id}:${i + 1}`, on = !!S.sets[k];
     if (on) done++;
-    const prev = base ? String(base.reps).split("-").map((x) => parseInt(x)).filter((x) => !isNaN(x)) : [];
     const dflt = repsFor(ex, i, base);
-    return `<div class="set ${on ? "on" : ""}">
-      <label>Serie ${i + 1}</label>
+    const isTs = tsMode && i === 0;
+    const isBo = tsMode && i > 0;
+    const lbl = isTs ? "TOP SET" : isBo ? `BO ${i}` : `Serie ${i + 1}`;
+    return `<div class="set ${isTs ? "ts" : ""} ${isBo ? "bo" : ""} ${on ? "on" : ""}">
+      <label>${lbl}</label>
       <input type="number" inputmode="numeric" value="${dflt}" data-rep="${k}">
       <button class="chk" data-set="${k}">${on ? "✓" : "○"}</button>
     </div>`;
   }).join("");
 
   let prevLine;
-  if (base && base.reset)
-    prevLine = `<div class="prev warn">Riadattamento del ${esc(base.data)} — riparti da ${base.kg} kg · ${esc(base.reps)}${base.note ? ` · ${esc(base.note)}` : ""}</div>`;
-  else if (base)
-    prevLine = `<div class="prev">Ultima volta (${esc(base.data)}): ${base.kg} kg · ${esc(base.reps)}</div>`;
-  else prevLine = `<div class="prev none">Mai registrato — trova il carico oggi</div>`;
+  if (base && base.reset) {
+    prevLine = `<div class="prev warn">Riadattamento del ${esc(base.data)} — riparti da ${fmtKg(base.kg)} kg · ${esc(base.reps)}${base.note ? ` · ${esc(base.note)}` : ""}</div>`;
+  } else if (base && base.parsed && base.parsed.isTopBo) {
+    const p = base.parsed;
+    const pezzi = [];
+    if (p.tsRep !== null) pezzi.push(`TS ${fmtKg(p.topKg)} kg × ${p.tsRep}`);
+    if (p.boReps.length) pezzi.push(`BO ${fmtKg(p.boKg)} kg × ${p.boReps.join("-")}`);
+    prevLine = `<div class="prev">Ultima volta (${esc(base.data)}): ${esc(pezzi.join(" · "))}</div>`;
+  } else if (base) {
+    prevLine = `<div class="prev">Ultima volta (${esc(base.data)}): ${fmtKg(base.kg)} kg · ${esc(base.reps)}</div>`;
+  } else {
+    prevLine = `<div class="prev none">Mai registrato — trova il carico oggi</div>`;
+  }
 
   const top = topReps(ex);
   const kgCls = base && base.reset ? "reset" : (up && !changed ? "up" : "");
-  const kgLbl = base && base.reset ? "KG — riparti da qui"
-    : (up && !changed ? `KG — sali, hai chiuso tutte le serie a ${top}` : "KG");
+  const kgLbl = base && base.reset
+    ? (tsMode ? "TOP SET — riparti" : "KG — riparti da qui")
+    : (up && !changed
+      ? (tsMode ? `TOP SET — sali (${top} ok)` : `KG — sali, chiuse a ${top}`)
+      : (tsMode ? "TOP SET (KG)" : "KG"));
 
-  const target = [`${ex["Serie target"]}×${ex["Ripetizioni target"]}`,
-    ex.Recupero ? `rec ${ex.Recupero}` : ""].filter(Boolean).join(" · ");
+  const diffKg = Math.round((num(kg) - boVal) * 100) / 100;
+  const boSub = num(kg) > 0
+    ? (boManual
+      ? `BACK-OFF · manuale (auto ${fmtKg(boAuto)})`
+      : `BACK-OFF · −${fmtKg(diffKg)} kg (auto)`)
+    : "BACK-OFF (KG)";
+
+  const target = tsMode
+    ? [`1 Top Set (${ex["Ripetizioni target"]}) + ${n - 1} Back-off (${boRange(ex)})`,
+      ex.Recupero ? `rec ${ex.Recupero}` : ""].filter(Boolean).join(" · ")
+    : [`${ex["Serie target"]}×${ex["Ripetizioni target"]}`,
+      ex.Recupero ? `rec ${ex.Recupero}` : ""].filter(Boolean).join(" · ");
+
+  const modeBtn = n >= 2
+    ? `<button class="modebtn ${tsMode ? "on" : ""}" data-mode="${esc(id)}" title="Alterna tra Top Set + Back-off e carico fisso">${tsMode ? "Top+BO" : "Fisso"}</button>`
+    : "";
+
+  const footHtml = tsMode
+    ? `<div class="foot bo-grid">
+        <div class="kg ts-box ${kgCls}">
+          <span>${esc(kgLbl)}</span>
+          <input type="number" step="any" inputmode="decimal" value="${kg}" data-kg="${esc(id)}">
+        </div>
+        <div class="kg bo-box ${boManual ? "manual" : ""}">
+          <span data-bohint="${esc(id)}">${esc(boSub)}</span>
+          <input type="number" step="any" inputmode="decimal" value="${boVal}" data-bokg="${esc(id)}">
+        </div>
+        <button class="rest wide" data-rest="${esc(id)}" data-secs="${secs(ex.Recupero)}">
+          <b>${secs(ex.Recupero)}s</b><small>recupero</small>
+        </button>
+      </div>`
+    : `<div class="foot">
+        <div class="kg ${kgCls}">
+          <span>${esc(kgLbl)}</span>
+          <input type="number" step="any" inputmode="decimal" value="${kg}" data-kg="${esc(id)}">
+        </div>
+        <button class="rest" data-rest="${esc(id)}" data-secs="${secs(ex.Recupero)}">
+          <b>${secs(ex.Recupero)}s</b><small>recupero</small>
+        </button>
+      </div>`;
 
   return `
   <div class="ex ${done === n ? "done" : ""} ${base && base.reset ? "reset" : ""}" data-ex="${esc(id)}">
@@ -196,21 +398,16 @@ function exCard(ex) {
         <div class="ex-num">${ex.Ordine}</div>
         <div class="ex-name">${esc(ex.Esercizio)}</div>
       </div>
-      ${done === n ? '<div class="tick">✓</div>' : done ? `<div class="ex-num">${done}/${n}</div>` : ""}
+      <div class="ex-right">
+        ${modeBtn}
+        ${done === n ? '<div class="tick">✓</div>' : done ? `<div class="ex-num">${done}/${n}</div>` : ""}
+      </div>
     </div>
     <div class="ex-target">${esc(target)}</div>
     ${prevLine}
     ${ex["Note tecnica"] ? `<details class="tech"><summary>Note tecnica</summary><p>${esc(ex["Note tecnica"])}</p></details>` : ""}
     <div class="sets">${sets}</div>
-    <div class="foot">
-      <div class="kg ${kgCls}">
-        <span>${esc(kgLbl)}</span>
-        <input type="number" step="0.25" inputmode="decimal" value="${kg}" data-kg="${esc(id)}">
-      </div>
-      <button class="rest" data-rest="${esc(id)}" data-secs="${secs(ex.Recupero)}">
-        <b>${secs(ex.Recupero)}s</b><small>recupero</small>
-      </button>
-    </div>
+    ${footHtml}
   </div>`;
 }
 
@@ -219,9 +416,14 @@ function analisi() {
   const byId = {};
   DB.log.forEach((r) => {
     const d = String(r.Data).slice(0, 10);
-    (byId[r.Esercizio] ||= []).push({ d, kg: num(r.KG), reps: r["Reps fatte"], vol: num(r.KG) * repsSum(r["Reps fatte"]) });
+    const p = parseLogEntry(r.KG, r["Reps fatte"]);
+    (byId[r.Esercizio] ||= []).push({
+      d,
+      kg: p.topKg,
+      reps: r["Reps fatte"],
+      vol: p.volume,
+    });
   });
-  const attivi = new Set(DB.esercizi.map((e) => e.ID));
   const oggi = Date.now();
   const out = [];
 
@@ -285,7 +487,7 @@ function viewDebolezze() {
 
   return `
   <h2>Debolezze</h2>
-  <p class="sub">Confronto il volume delle ultime due sedute con le due precedenti. In calo sotto il −5%, fermo se stesso carico da 3 sedute.</p>
+  <p class="sub">Confronto il volume reale (Top Set + Back-off) delle ultime due sedute con le due precedenti. In calo sotto il −5%, fermo se stesso carico da 3 sedute.</p>
   <div class="stats">
     <div class="stat red"><b>${c("regressione")}</b><span>in calo</span></div>
     <div class="stat amber"><b>${c("stallo")}</b><span>fermi</span></div>
@@ -309,7 +511,7 @@ function viewRiadatta() {
 
   return `
   <h2>Riadatta</h2>
-  <p class="sub">Azzera la progressione di un esercizio: la prossima seduta parte da questi valori invece che dall'ultima performance.</p>
+  <p class="sub">Azzera la progressione di un esercizio: la prossima seduta parte da questo carico sul Top Set (il back-off si ricalcola in automatico).</p>
   <div class="card">
     <label class="f">Esercizio</label>
     <select class="f" id="rEx">${opts}</select>
@@ -363,9 +565,6 @@ function viewStorico() {
 
 /* ---------------- render: analisi per esercizio ---------------- */
 
-// Epley: stima del massimale da una serie. Serie sotto le 12 reps, oltre perde precisione.
-const e1rm = (kg, reps) => (reps > 0 && reps <= 12) ? kg * (1 + reps / 30) : kg;
-
 // La data da cui parte la scheda v2: prima di quella i numeri non sono confrontabili.
 function dataV2() {
   const ev = DB.eventi.find((e) => String(e.Tipo).toUpperCase() === "CAMBIO_SCHEDA");
@@ -378,16 +577,21 @@ function serie(id) {
   return DB.log
     .filter((r) => r.Esercizio === id && String(r.Data).slice(0, 10) >= da)
     .map((r) => {
-      const kg = num(r.KG);
-      const reps = String(r["Reps fatte"]).split("-").map((x) => parseInt(x)).filter((x) => !isNaN(x));
-      const tot = reps.reduce((a, b) => a + b, 0);
+      const p = parseLogEntry(r.KG, r["Reps fatte"]);
       return {
         d: String(r.Data).slice(0, 10),
-        kg, reps, tot,
-        serie: reps.length,
-        volume: kg * tot,
-        best: Math.max(...reps.map((x) => e1rm(kg, x)), 0),
-        media: reps.length ? tot / reps.length : 0,
+        kg: p.topKg,
+        reps: p.reps,
+        raw: p.raw,
+        isTopBo: p.isTopBo,
+        tsRep: p.tsRep,
+        boKg: p.boKg,
+        boReps: p.boReps,
+        tot: p.tot,
+        serie: p.serie,
+        volume: p.volume,
+        best: p.best,
+        media: p.serie ? p.tot / p.serie : 0,
       };
     })
     .sort((a, b) => a.d.localeCompare(b.d));
@@ -427,7 +631,6 @@ function viewAnalisi() {
   const opts = conDati.map((e) =>
     `<option value="${esc(e.ID)}" ${e.ID === S.exSel ? "selected" : ""}>${esc(e.Scheda.split(" ")[0])} · ${esc(e.Esercizio)}</option>`).join("");
 
-  // confronto: prime due sedute contro ultime due (più stabile del singolo dato)
   const half = (arr, k) => arr.length >= 4
     ? [(arr[0][k] + arr[1][k]) / 2, (arr[arr.length - 2][k] + arr[arr.length - 1][k]) / 2]
     : [first[k], last[k]];
@@ -438,16 +641,18 @@ function viewAnalisi() {
 
   const top = topReps(ex), bot = botReps(ex), nS = nSerie(ex);
   const inRange = last.reps.filter((r) => r >= bot).length;
-  const chiuse = last.reps.filter((r) => r >= top).length;
+  const chiuse = last.reps.filter((r) => top && r >= top).length;
+  const topChiuso = last.isTopBo && top && last.tsRep !== null && last.tsRep >= top;
 
-  // Quanto pesa questo esercizio sul carico settimanale
   const volTot = DB.log.filter((r) => String(r.Data).slice(0, 10) >= dataV2())
-    .reduce((a, r) => a + num(r.KG) * repsSum(r["Reps fatte"]), 0);
+    .reduce((a, r) => a + parseLogEntry(r.KG, r["Reps fatte"]).volume, 0);
   const quota = volTot > 0 ? (g.reduce((a, x) => a + x.volume, 0) / volTot) * 100 : 0;
 
-  // Giudizio: che cosa dice davvero questa serie di numeri
   let verdetto, vColor;
-  if (chiuse >= nS) {
+  if (topChiuso) {
+    verdetto = `Top Set chiuso a ${last.tsRep} reps con ${last.kg} kg. Sali di peso sul Top Set alla prossima seduta: il back-off si aggiornerà in automatico.`;
+    vColor = "var(--green)";
+  } else if (!last.isTopBo && top && chiuse >= nS) {
     verdetto = `Hai chiuso tutte le serie a ${top}. Sali di peso alla prossima seduta e riparti da ${bot}.`;
     vColor = "var(--green)";
   } else if (g.length < 3) {
@@ -457,7 +662,7 @@ function viewAnalisi() {
     verdetto = `Il massimale stimato sale. È la crescita che cerchi: stai spostando più carico a parità di ripetizioni.`;
     vColor = "var(--green)";
   } else if (pct(v0, v1) > 5 && Math.abs(pct(c0, c1)) < 1) {
-    verdetto = `Carico fermo ma volume in salita: stai accumulando ripetizioni. È la fase che precede l'aumento di peso — continua fino a chiudere tutte le serie a ${top}.`;
+    verdetto = `Carico fermo ma volume in salita: stai accumulando ripetizioni. È la fase che precede l'aumento di peso — punta a chiudere il Top Set a ${top}.`;
     vColor = "var(--amber)";
   } else if (pct(v0, v1) < -5) {
     verdetto = `Volume in calo del ${Math.abs(pct(v0, v1)).toFixed(0)}%. Se non è una settimana di scarico, il carico è troppo alto: riadattalo invece di insistere.`;
@@ -467,11 +672,24 @@ function viewAnalisi() {
     for (let i = g.length - 2; i >= 0 && g[i].kg === last.kg; i--) stat++;
     verdetto = stat >= 3
       ? `Fermo a ${last.kg} kg da ${stat} sedute senza guadagnare ripetizioni. Questo esercizio ha smesso di darti stimolo: riadattalo.`
-      : `Progressione piatta ma dentro la norma. Tieni il carico e punta a chiudere tutte le serie a ${top}.`;
+      : `Progressione piatta ma dentro la norma. Tieni il carico e punta a chiudere il Top Set a ${top}.`;
     vColor = stat >= 3 ? "var(--red)" : "var(--muted)";
   }
 
   const labels = g.map((x) => x.d.slice(5));
+
+  const targetRows = last.isTopBo
+    ? `<tr><td>Target</td><td><b>1 TS (${esc(ex["Ripetizioni target"])}) + ${nS - 1} BO (${esc(boRange(ex))})</b></td></tr>
+       <tr><td>Top Set</td><td><b style="color:${topChiuso ? "var(--green)" : "inherit"}">${last.tsRep ?? "—"} reps @ ${last.kg} kg</b>${topChiuso ? " — sali di peso" : ""}</td></tr>
+       <tr><td>Back-off</td><td><b>${last.boReps.length ? `${last.boReps.join("-")} @ ${fmtKg(last.boKg)} kg` : "—"}</b></td></tr>
+       <tr><td>Serie completate</td><td><b>${last.serie} su ${nS}</b></td></tr>
+       <tr><td>Quota sul volume totale</td><td><b>${quota.toFixed(1)}%</b></td></tr>`
+    : `<tr><td>Target</td><td><b>${nS} × ${esc(ex["Ripetizioni target"])}</b></td></tr>
+       <tr><td>Serie completate</td><td><b>${last.serie} su ${nS}</b></td></tr>
+       <tr><td>Serie dentro il range</td><td><b>${inRange} su ${last.serie}</b></td></tr>
+       <tr><td>Serie chiuse a ${top}</td><td><b style="color:${chiuse === nS ? "var(--green)" : "inherit"}">${chiuse} su ${nS}</b>${chiuse === nS ? " — sali di peso" : ""}</td></tr>
+       <tr><td>Reps medie</td><td><b>${last.media.toFixed(1)}</b></td></tr>
+       <tr><td>Quota sul volume totale</td><td><b>${quota.toFixed(1)}%</b></td></tr>`;
 
   return `
   <h2>Analisi</h2>
@@ -482,7 +700,7 @@ function viewAnalisi() {
   <div class="stats">
     <div class="stat"><b>${k1.toFixed(1)}</b><span>1RM stimato · ${trend(pct(k0, k1))}</span></div>
     <div class="stat"><b>${Math.round(v1)}</b><span>volume seduta · ${trend(pct(v0, v1))}</span></div>
-    <div class="stat"><b>${last.kg}</b><span>carico kg · ${trend(pct(c0, c1))}</span></div>
+    <div class="stat"><b>${last.kg}</b><span>carico Top · ${trend(pct(c0, c1))}</span></div>
   </div>
 
   <div class="card" style="border-left:3px solid ${vColor}">
@@ -491,18 +709,18 @@ function viewAnalisi() {
 
   <div class="card">
     <div class="spread"><b class="gt">Massimale stimato</b><span class="small muted">kg</span></div>
-    <p class="small muted" style="margin:2px 0 6px">La forza pura. Se sale, il muscolo sta crescendo.</p>
+    <p class="small muted" style="margin:2px 0 6px">La forza pura (calcolata su Top Set e Back-off). Se sale, il muscolo sta crescendo.</p>
     ${chart(g.map((x) => x.best), labels, "kg", "var(--green)")}
   </div>
 
   <div class="card">
     <div class="spread"><b class="gt">Volume per seduta</b><span class="small muted">kg × reps</span></div>
-    <p class="small muted" style="margin:2px 0 6px">Il lavoro totale. È il driver principale dell'ipertrofia.</p>
+    <p class="small muted" style="margin:2px 0 6px">Il lavoro totale effettivo (Top Set + Back-off). È il driver principale dell'ipertrofia.</p>
     ${chart(g.map((x) => x.volume), labels, "", "var(--blue)")}
   </div>
 
   <div class="card">
-    <div class="spread"><b class="gt">Carico usato</b><span class="small muted">kg</span></div>
+    <div class="spread"><b class="gt">Carico Top Set</b><span class="small muted">kg</span></div>
     <p class="small muted" style="margin:2px 0 6px">Deve salire a gradini, non di continuo.</p>
     ${chart(g.map((x) => x.kg), labels, "kg", "var(--amber)")}
   </div>
@@ -513,21 +731,14 @@ function viewAnalisi() {
       <tr><th>Data</th><th>KG</th><th>Reps</th><th>Vol.</th><th>1RM</th></tr>
       ${[...g].reverse().slice(0, 12).map((x) => `<tr>
         <td>${esc(x.d.slice(5))}</td><td>${x.kg}</td>
-        <td>${x.reps.join("-")}</td><td>${Math.round(x.volume)}</td>
+        <td>${esc(x.raw)}</td><td>${Math.round(x.volume)}</td>
         <td>${x.best.toFixed(1)}</td></tr>`).join("")}
     </table>
   </div>
 
   <div class="card">
     <b class="gt">Ultima seduta contro il target</b>
-    <table style="margin-top:8px">
-      <tr><td>Target</td><td><b>${nS} × ${esc(ex["Ripetizioni target"])}</b></td></tr>
-      <tr><td>Serie completate</td><td><b>${last.serie} su ${nS}</b></td></tr>
-      <tr><td>Serie dentro il range</td><td><b>${inRange} su ${last.serie}</b></td></tr>
-      <tr><td>Serie chiuse a ${top}</td><td><b style="color:${chiuse === nS ? "var(--green)" : "inherit"}">${chiuse} su ${nS}</b>${chiuse === nS ? " — sali di peso" : ""}</td></tr>
-      <tr><td>Reps medie</td><td><b>${last.media.toFixed(1)}</b></td></tr>
-      <tr><td>Quota sul volume totale</td><td><b>${quota.toFixed(1)}%</b></td></tr>
-    </table>
+    <table style="margin-top:8px">${targetRows}</table>
   </div>`;
 }
 
@@ -544,6 +755,23 @@ function render() {
 function bind() {
   document.querySelectorAll("[data-day]").forEach((b) => b.onclick = () => { S.day = b.dataset.day; save(); render(); });
 
+  // Scelta percentuale globale del back-off (-10%, -12.5%, -15%)
+  document.querySelectorAll("[data-bopct]").forEach((b) => b.onclick = () => {
+    S.boPct = parseFloat(b.dataset.bopct);
+    S.boKg = {}; // ricalcola tutti i back-off col nuovo valore
+    save();
+    render();
+  });
+
+  // Toggle per singolo esercizio: Top+BO <-> Fisso
+  document.querySelectorAll("[data-mode]").forEach((b) => b.onclick = () => {
+    const id = b.dataset.mode;
+    if (S.mode[id] === "flat") delete S.mode[id];
+    else S.mode[id] = "flat";
+    save();
+    render();
+  });
+
   const tg = $("#tToggle");
   if (tg) tg.onclick = () => {
     if (S.tRun) { S.tAcc += Math.floor(Date.now() / 1000 - S.tStart); S.tRun = false; }
@@ -556,20 +784,66 @@ function bind() {
   document.querySelectorAll("[data-set]").forEach((b) => b.onclick = () => {
     const k = b.dataset.set; S.sets[k] = !S.sets[k]; save(); render();
   });
-  // oninput e non onchange: onchange scatta solo quando esci dal campo, quindi
-  // chiudendo il browser col cursore ancora dentro il numero si perdeva.
+
   document.querySelectorAll("[data-rep]").forEach((i) => i.oninput = () => {
     const v = parseInt(i.value);
     if (isNaN(v) || v <= 0) delete S.reps[i.dataset.rep];
     else S.reps[i.dataset.rep] = v;
     save();
   });
-  // Il peso si memorizza a ogni cifra, ma si ridisegna solo quando esci dal campo:
-  // ridisegnare a ogni tasto farebbe perdere il cursore.
+
+  // Top Set KG: aggiorna LIVE il campo Back-off senza ridisegnare la card (non perdi il cursore)
   document.querySelectorAll("[data-kg]").forEach((i) => {
-    i.oninput = () => { S.kg[i.dataset.kg] = num(i.value); save(); };
-    i.onchange = () => { S.kg[i.dataset.kg] = num(i.value); save(); render(); };
+    const id = i.dataset.kg;
+    i.oninput = () => {
+      const val = num(i.value);
+      S.kg[id] = val;
+      delete S.boKg[id]; // ricalcola il back-off automaticamente
+      const boInput = document.querySelector(`[data-bokg="${CSS.escape(id)}"]`);
+      const boHint = document.querySelector(`[data-bohint="${CSS.escape(id)}"]`);
+      if (boInput) {
+        const newBo = calcBackoff(val, S.boPct, S.boStep);
+        boInput.value = newBo;
+        const box = boInput.closest(".bo-box");
+        if (box) box.classList.remove("manual");
+        if (boHint) {
+          const diff = Math.round((val - newBo) * 100) / 100;
+          boHint.textContent = val > 0 ? `BACK-OFF · −${fmtKg(diff)} kg (auto)` : "BACK-OFF (KG)";
+        }
+      }
+      save();
+    };
+    i.onchange = () => {
+      S.kg[id] = num(i.value);
+      delete S.boKg[id];
+      save();
+      render();
+    };
   });
+
+  // Back-off KG: modificabile manualmente se una macchina ha un pacco pesi particolare
+  document.querySelectorAll("[data-bokg]").forEach((i) => {
+    const id = i.dataset.bokg;
+    i.oninput = () => {
+      const val = num(i.value);
+      S.boKg[id] = val;
+      const topInput = document.querySelector(`[data-kg="${CSS.escape(id)}"]`);
+      const topVal = topInput ? num(topInput.value) : 0;
+      const autoVal = calcBackoff(topVal, S.boPct, S.boStep);
+      const boHint = document.querySelector(`[data-bohint="${CSS.escape(id)}"]`);
+      const box = i.closest(".bo-box");
+      const isManual = Math.abs(val - autoVal) > 1e-9;
+      if (box) box.classList.toggle("manual", isManual);
+      if (boHint) {
+        const diff = Math.round((topVal - val) * 100) / 100;
+        boHint.textContent = isManual
+          ? `BACK-OFF · manuale (auto ${fmtKg(autoVal)})`
+          : `BACK-OFF · −${fmtKg(diff)} kg (auto)`;
+      }
+      save();
+    };
+  });
+
   document.querySelectorAll("[data-rest]").forEach((b) => b.onclick = () => {
     const id = b.dataset.rest;
     unlockAudio();
@@ -589,7 +863,7 @@ function bind() {
   const bs = $("#btnSave"); if (bs) bs.onclick = saveWorkout;
   const bc = $("#btnClear"); if (bc) bc.onclick = () => {
     if (!confirm("Svuoto serie, ripetizioni e cronometro di questa seduta?")) return;
-    S.sets = {}; S.reps = {}; S.kg = {}; S.note = ""; S.tAcc = 0; S.tRun = false; S.rest = {};
+    S.sets = {}; S.reps = {}; S.kg = {}; S.boKg = {}; S.note = ""; S.tAcc = 0; S.tRun = false; S.rest = {};
     save(); render();
   };
 
@@ -608,7 +882,8 @@ function tickTimers() {
 
   document.querySelectorAll("[data-rest]").forEach((b) => {
     const end = S.rest[b.dataset.rest];
-    b.className = "rest";
+    const isWide = b.classList.contains("wide");
+    b.className = isWide ? "rest wide" : "rest";
     if (!end) { b.innerHTML = `<b>${b.dataset.secs}s</b><small>recupero</small>`; return; }
     const left = Math.round((end - Date.now()) / 1000);
     if (left > 0) { b.classList.add("run"); b.innerHTML = `<b>${left}s</b><small>tocca per fermare</small>`; }
@@ -620,8 +895,6 @@ function tickTimers() {
 }
 setInterval(tickTimers, 1000);
 
-/* La suoneria insiste: se sei distratto te ne accorgi comunque.
-   Si ferma toccando il timer, o da sola dopo 2 minuti. */
 let alarmId = null, alarmTimer = null, alarmStop = null;
 
 function startAlarm(id) {
@@ -632,7 +905,6 @@ function startAlarm(id) {
   alarmTimer = setInterval(beep, 2500);
   alarmStop = setTimeout(stopAlarm, 120000);
 }
-// iOS e Android bloccano l'audio finché non c'è stato un tocco: lo sblocchiamo al primo.
 function unlockAudio() {
   try {
     ctx ||= new (window.AudioContext || window.webkitAudioContext)();
@@ -640,7 +912,6 @@ function unlockAudio() {
   } catch (e) { }
 }
 document.addEventListener("pointerdown", unlockAudio, { once: true });
-// Un tocco qualsiasi mentre suona la spegne.
 document.addEventListener("pointerdown", () => { if (alarmId) stopAlarm(); });
 
 function stopAlarm() {
@@ -682,13 +953,34 @@ async function saveWorkout() {
 
   const righe = [];
   list.forEach((ex) => {
-    const n = nSerie(ex), reps = [];
+    const n = nSerie(ex);
     const base = baseline(ex.ID);
-    for (let i = 0; i < n; i++)
-      if (S.sets[`${ex.ID}:${i + 1}`]) reps.push(repsFor(ex, i, base));
-    if (!reps.length) return;
     const kg = S.kg[ex.ID] !== undefined ? S.kg[ex.ID] : (base ? base.kg : 0);
-    righe.push(["LOG-" + Math.random().toString(16).slice(2, 10), oggi, sid, ex.ID, kg, reps.join("-"), reps.length]);
+
+    if (isTopBo(ex)) {
+      const tsOn = !!S.sets[`${ex.ID}:1`];
+      const tsRep = tsOn ? repsFor(ex, 0, base) : null;
+      const boReps = [];
+      for (let i = 1; i < n; i++) {
+        if (S.sets[`${ex.ID}:${i + 1}`]) boReps.push(repsFor(ex, i, base));
+      }
+      const totSerie = (tsOn ? 1 : 0) + boReps.length;
+      if (!totSerie) return;
+
+      const boVal = currentBoKg(ex.ID, kg);
+      let repsStr;
+      if (tsOn && boReps.length) repsStr = `${tsRep} | ${boReps.join("-")} @${fmtKg(boVal)}`;
+      else if (tsOn) repsStr = `${tsRep} |`;
+      else repsStr = `| ${boReps.join("-")} @${fmtKg(boVal)}`;
+
+      righe.push(["LOG-" + Math.random().toString(16).slice(2, 10), oggi, sid, ex.ID, kg, repsStr, totSerie]);
+    } else {
+      const reps = [];
+      for (let i = 0; i < n; i++)
+        if (S.sets[`${ex.ID}:${i + 1}`]) reps.push(repsFor(ex, i, base));
+      if (!reps.length) return;
+      righe.push(["LOG-" + Math.random().toString(16).slice(2, 10), oggi, sid, ex.ID, kg, reps.join("-"), reps.length]);
+    }
   });
 
   if (!righe.length) return toast("Spunta almeno una serie prima di salvare.", true);
@@ -701,7 +993,7 @@ async function saveWorkout() {
       sessione: [sid, oggi, S.day, S.rpe, S.sonno, S.stress, S.note, hhmmss(t)],
       righe,
     });
-    S.sets = {}; S.reps = {}; S.kg = {}; S.note = ""; S.tAcc = 0; S.tRun = false; S.tStart = 0; S.rest = {};
+    S.sets = {}; S.reps = {}; S.kg = {}; S.boKg = {}; S.note = ""; S.tAcc = 0; S.tRun = false; S.tStart = 0; S.rest = {};
     save();
     toast(`Salvato — ${righe.length} esercizi, durata ${hhmmss(t)}`);
     await boot();
@@ -740,11 +1032,7 @@ async function saveDeload() {
 }
 
 
-/* ---------------- tastierino di accesso ----------------
-   Tiene fuori chi capita sull'indirizzo per caso. Non e una protezione forte:
-   il codice sta nel browser e chi guarda il sorgente lo trova. Per un diario
-   di allenamento va bene cosi. */
-
+/* ---------------- tastierino di accesso ---------------- */
 const PIN = "134679";
 const PIN_OK = "refood.pin.ok";
 
@@ -796,7 +1084,6 @@ function lock(then) {
   el.querySelector('[data-act="del"]').onclick = () => { buf = buf.slice(0, -1); dots(); };
   el.querySelector('[data-act="clr"]').onclick = () => { buf = ""; dots(); };
 
-  // funziona anche da tastiera fisica
   document.addEventListener("keydown", function onKey(e) {
     if (!document.body.contains(el)) return document.removeEventListener("keydown", onKey);
     if (/^[0-9]$/.test(e.key)) press(e.key);
@@ -814,12 +1101,10 @@ async function boot() {
     render();
   } catch (e) {
     $("#main").innerHTML = `<div class="banner"><b>Il foglio non risponde.</b><br>${esc(e.message)}
-      <br><br>Controlla le variabili su Netlify e che il foglio sia condiviso con l'indirizzo del service account.</div>`;
+      <br><br>Controlla le variabili d'ambiente su Vercel e che il foglio sia condiviso con l'indirizzo del service account.</div>`;
   }
 }
 
-// Rete di sicurezza: il telefono puo chiudere la pagina senza preavviso.
-// Salviamo anche quando l'app va in secondo piano o la scheda si chiude.
 document.addEventListener("visibilitychange", () => { if (document.hidden) save(); });
 window.addEventListener("pagehide", save);
 
